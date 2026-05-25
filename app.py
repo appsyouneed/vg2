@@ -9,6 +9,7 @@ import warnings
 import time
 import gc
 import uuid
+import re
 import threading
 from pathlib import Path
 from tqdm import tqdm
@@ -263,6 +264,7 @@ def build_lora_choices() -> dict:
     lora_files = [
         f for f in all_files
         if f.startswith("loras/") and f.endswith(".safetensors")
+        and not (re.search(r't2v', f, re.IGNORECASE) and not re.search(r'i2v', f, re.IGNORECASE))
     ]
 
     high_map = {}  # base_name -> filename (with loras/ prefix)
@@ -305,100 +307,65 @@ LORA_NAMES = ["None"] + sorted(LORA_CHOICES.keys())
 
 # --- MMAUDIO SETUP ---
 
-import mmaudio
-from mmaudio.eval_utils import generate, load_video, make_video
-from mmaudio.model.flow_matching import FlowMatching
-from mmaudio.model.networks import MMAudio, get_my_mmaudio
-from mmaudio.model.sequence_config import SequenceConfig
-from mmaudio.model.utils.features_utils import FeaturesUtils
-
+MMAUDIO_REPO = "cloud19/NSFW_MMaudio"
 MMAUDIO_DIR = Path("/root/vidgen/mmaudio")
 MMAUDIO_DIR.mkdir(parents=True, exist_ok=True)
 
+# Files to download from cloud19/NSFW_MMaudio
 _MMAUDIO_FILES = [
-    "mmaudio/apple_DFN5B-CLIP-ViT-H-14-384_fp16.safetensors",
-    "mmaudio/mmaudio_large_44k_nsfw_gold_8.5k_final_fp16.safetensors",
-    "mmaudio/mmaudio_synchformer_fp16.safetensors",
-    "mmaudio/mmaudio_vae_44k_fp16.safetensors",
+    "weights/mmaudio_large_44k_v2.pth",
+    "ext_weights/synchformer_state_dict.pth",
+    "ext_weights/v1-44.pth",
+    "nsfw_gold_8.5k_final.pth",
 ]
-_MMAUDIO_BIGVGAN_DIR = "mmaudio/nvidia/bigvgan_v2_44khz_128band_512x"
 
 def _ensure_mmaudio_files():
     for repo_path in _MMAUDIO_FILES:
-        local_path = MMAUDIO_DIR / Path(repo_path).name
+        local_path = MMAUDIO_DIR / repo_path
         if not local_path.exists():
-            print(f"Downloading {repo_path}...")
+            print(f"Downloading mmaudio/{repo_path}...")
             hf_hub_download(
-                repo_id=LORA_REPO,
+                repo_id=MMAUDIO_REPO,
                 filename=repo_path,
                 local_dir=str(MMAUDIO_DIR),
                 local_dir_use_symlinks=False,
             )
-    # BigVGAN dir - download all files in it
-    bigvgan_local = MMAUDIO_DIR / "nvidia" / "bigvgan_v2_44khz_128band_512x"
-    if not bigvgan_local.exists():
-        print("Downloading BigVGAN model dir...")
-        try:
-            all_files = list(list_repo_files(LORA_REPO))
-            bv_files = [f for f in all_files if f.startswith(_MMAUDIO_BIGVGAN_DIR + "/")]
-            for f in bv_files:
-                hf_hub_download(
-                    repo_id=LORA_REPO,
-                    filename=f,
-                    local_dir=str(MMAUDIO_DIR),
-                    local_dir_use_symlinks=False,
-                )
-        except Exception as e:
-            print(f"Warning: BigVGAN download error: {e}")
 
 _ensure_mmaudio_files()
 
-# Build a custom ModelConfig pointing to local files
-from dataclasses import dataclass
-
-@dataclass
-class _LocalModelConfig:
-    model_name: str
-    model_path: Path
-    vae_path: Path
-    synchformer_ckpt: Path
-    mode: str = "44k"
-
-    @property
-    def seq_cfg(self) -> SequenceConfig:
-        from mmaudio.model.sequence_config import CONFIG_44K
-        return CONFIG_44K
-
-_mmaudio_cfg = _LocalModelConfig(
-    model_name="large_44k_v2",
-    model_path=MMAUDIO_DIR / "mmaudio_large_44k_nsfw_gold_8.5k_final_fp16.safetensors",
-    vae_path=MMAUDIO_DIR / "mmaudio_vae_44k_fp16.safetensors",
-    synchformer_ckpt=MMAUDIO_DIR / "mmaudio_synchformer_fp16.safetensors",
-)
-
-_mm_dtype = torch.bfloat16
-
-def _load_mmaudio():
-    cfg = _mmaudio_cfg
-    seq_cfg = cfg.seq_cfg
-    net: MMAudio = get_my_mmaudio(cfg.model_name).to(device, _mm_dtype).eval()
-    net.load_weights(torch.load(str(cfg.model_path), map_location=device, weights_only=True))
-    feature_utils = FeaturesUtils(
-        tod_vae_ckpt=str(cfg.vae_path),
-        synchformer_ckpt=str(cfg.synchformer_ckpt),
-        enable_conditions=True,
-        mode=cfg.mode,
-        bigvgan_vocoder_ckpt=None,
-        need_vae_encoder=False,
-    )
-    feature_utils = feature_utils.to(device, _mm_dtype).eval()
-    return net, feature_utils, seq_cfg
-
-print("Loading MMAudio...")
 try:
+    import mmaudio
+    from mmaudio.eval_utils import generate, load_video, make_video
+    from mmaudio.model.flow_matching import FlowMatching
+    from mmaudio.model.networks import MMAudio, get_my_mmaudio
+    from mmaudio.model.utils.features_utils import FeaturesUtils
+    from mmaudio.model.sequence_config import CONFIG_44K
+
+    _mm_dtype = torch.bfloat16
+    _mm_model_path = MMAUDIO_DIR / "weights/mmaudio_large_44k_v2.pth"
+    _mm_nsfw_path  = MMAUDIO_DIR / "nsfw_gold_8.5k_final.pth"
+    _mm_vae_path   = MMAUDIO_DIR / "ext_weights/v1-44.pth"
+    _mm_sync_path  = MMAUDIO_DIR / "ext_weights/synchformer_state_dict.pth"
+
+    def _load_mmaudio():
+        seq_cfg = CONFIG_44K
+        net: MMAudio = get_my_mmaudio("large_44k").to(device, _mm_dtype).eval()
+        net.load_weights(torch.load(str(_mm_nsfw_path), map_location=device, weights_only=True))
+        feature_utils = FeaturesUtils(
+            tod_vae_ckpt=str(_mm_vae_path),
+            synchformer_ckpt=str(_mm_sync_path),
+            enable_conditions=True,
+            mode="44k",
+            bigvgan_vocoder_ckpt=None,
+            need_vae_encoder=False,
+        ).to(device, _mm_dtype).eval()
+        return net, feature_utils, seq_cfg
+
+    print("Loading MMAudio...")
     _mm_net, _mm_feature_utils, _mm_seq_cfg = _load_mmaudio()
     print("MMAudio loaded.")
     _MMAUDIO_AVAILABLE = True
+
 except Exception as e:
     print(f"MMAudio load failed: {e}")
     _MMAUDIO_AVAILABLE = False
@@ -409,33 +376,37 @@ except Exception as e:
 def add_audio_to_video(video_path: str, audio_prompt: str, duration_sec: float) -> str:
     if not _MMAUDIO_AVAILABLE:
         return video_path
-    rng = torch.Generator(device=device)
-    rng.seed()
-    fm = FlowMatching(min_sigma=0, inference_mode='euler', num_steps=25)
-    video_info = load_video(Path(video_path), duration_sec)
-    clip_frames = video_info.clip_frames.unsqueeze(0)
-    sync_frames = video_info.sync_frames.unsqueeze(0)
-    _mm_seq_cfg.duration = video_info.duration_sec
-    _mm_net.update_seq_lengths(
-        _mm_seq_cfg.latent_seq_len,
-        _mm_seq_cfg.clip_seq_len,
-        _mm_seq_cfg.sync_seq_len,
-    )
-    audios = generate(
-        clip_frames,
-        sync_frames,
-        [audio_prompt],
-        negative_text=["music"],
-        feature_utils=_mm_feature_utils,
-        net=_mm_net,
-        fm=fm,
-        rng=rng,
-        cfg_strength=4.5,
-    )
-    audio = audios.float().cpu()[0]
-    out_path = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False).name
-    make_video(video_info, out_path, audio, sampling_rate=_mm_seq_cfg.sampling_rate)
-    return out_path
+    try:
+        rng = torch.Generator(device=device)
+        rng.seed()
+        fm = FlowMatching(min_sigma=0, inference_mode='euler', num_steps=25)
+        video_info = load_video(Path(video_path), duration_sec)
+        clip_frames = video_info.clip_frames.unsqueeze(0)
+        sync_frames = video_info.sync_frames.unsqueeze(0)
+        _mm_seq_cfg.duration = video_info.duration_sec
+        _mm_net.update_seq_lengths(
+            _mm_seq_cfg.latent_seq_len,
+            _mm_seq_cfg.clip_seq_len,
+            _mm_seq_cfg.sync_seq_len,
+        )
+        audios = generate(
+            clip_frames,
+            sync_frames,
+            [audio_prompt],
+            negative_text=["music"],
+            feature_utils=_mm_feature_utils,
+            net=_mm_net,
+            fm=fm,
+            rng=rng,
+            cfg_strength=4.5,
+        )
+        audio = audios.float().cpu()[0]
+        out_path = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False).name
+        make_video(video_info, out_path, audio, sampling_rate=_mm_seq_cfg.sampling_rate)
+        return out_path
+    except Exception as e:
+        print(f"MMAudio generation failed: {e}")
+        return video_path
 
 
 # WAN
@@ -457,7 +428,8 @@ MIN_FRAMES_MODEL = 8
 MAX_FRAMES_MODEL = 160
 
 MIN_DURATION = round(MIN_FRAMES_MODEL / FIXED_FPS, 1)
-MAX_DURATION = round(MAX_FRAMES_MODEL / FIXED_FPS, 1)
+MAX_DURATION = 60.0
+SEGMENT_DURATION = round(MAX_FRAMES_MODEL / FIXED_FPS, 1)  # max per segment (~10s)
 
 SCHEDULER_MAP = {
     "FlowMatchEulerDiscrete": FlowMatchEulerDiscreteScheduler,
@@ -626,29 +598,32 @@ def run_inference(
             config['flow_shift'] = flow_shift
         current_pipe.scheduler = scheduler_class.from_config(config)
 
-    # Dynamic LoRA: load, run, unload
+    # Dynamic LoRA: load, use, unload
     lora_applied = False
     if lora_name and lora_name != "None" and lora_name in LORA_CHOICES:
         lora_info = LORA_CHOICES[lora_name]
         high_tr = lora_info["high_tr"]
         low_tr = lora_info["low_tr"]
         try:
-            adapter_names = []
-            adapter_weights = []
-            name_h = Path(high_tr).stem + "_H"
+            import logging
+            _hf_logger = logging.getLogger("diffusers.loaders.lora_base")
+            _prev_level = _hf_logger.level
+            _hf_logger.setLevel(logging.ERROR)
+
+            name_h = re.sub(r'[^a-zA-Z0-9_]', '_', Path(high_tr).stem) + "_H"
             current_pipe.load_lora_weights(LORA_REPO, weight_name=high_tr, adapter_name=name_h)
-            adapter_names.append(name_h)
-            adapter_weights.append(float(lora_high_scale))
             if low_tr:
-                name_l = Path(low_tr).stem + "_L"
-                current_pipe.load_lora_weights(LORA_REPO, weight_name=low_tr, adapter_name=name_l)
-                adapter_names.append(name_l)
-                adapter_weights.append(float(lora_low_scale))
-            current_pipe.set_adapters(adapter_names, adapter_weights=adapter_weights)
+                name_l = re.sub(r'[^a-zA-Z0-9_]', '_', Path(low_tr).stem) + "_L"
+                current_pipe.load_lora_weights(LORA_REPO, weight_name=low_tr, adapter_name=name_l, load_into_transformer_2=True)
+                current_pipe.set_adapters([name_h, name_l], adapter_weights=[float(lora_high_scale), float(lora_low_scale)])
+            else:
+                current_pipe.set_adapters([name_h], adapter_weights=[float(lora_high_scale)])
+
+            _hf_logger.setLevel(_prev_level)
             lora_applied = True
-            print(f"LoRA applied: {lora_name}")
+            print(f"LoRA applied: {lora_name} (high={lora_high_scale}" + (f", low={lora_low_scale}" if low_tr else "") + ")")
         except Exception as e:
-            print(f"LoRA load error: {e}")
+            print(f"LoRA error: {e}")
             try:
                 current_pipe.unload_lora_weights()
             except Exception:
@@ -711,20 +686,37 @@ def run_inference(
     return video_path, task_name
 
 
+def concatenate_videos(video_paths: list, output_path: str, quality: int):
+    """Concatenate multiple mp4 clips into one using ffmpeg concat."""
+    if len(video_paths) == 1:
+        import shutil
+        shutil.copy(video_paths[0], output_path)
+        return
+    list_file = output_path + ".txt"
+    with open(list_file, "w") as f:
+        for p in video_paths:
+            f.write(f"file '{p}'\n")
+    subprocess.run([
+        "ffmpeg", "-y", "-f", "concat", "-safe", "0",
+        "-i", list_file, "-c", "copy", output_path
+    ], check=True, capture_output=True)
+    os.unlink(list_file)
+
+
 def generate_video(
     input_image,
     last_image,
     prompt,
-    steps=4,
+    steps=3,
     negative_prompt=default_negative_prompt,
-    duration_seconds=MAX_DURATION,
+    duration_seconds=3.5,
     guidance_scale=1,
     guidance_scale_2=1,
     seed=42,
-    randomize_seed=False,
-    quality=5,
+    randomize_seed=True,
+    quality=7,
     scheduler="UniPCMultistep",
-    flow_shift=6.0,
+    flow_shift=6.9,
     frame_multiplier=16,
     video_component=True,
     lora_name="None",
@@ -738,44 +730,83 @@ def generate_video(
         raise gr.Error("Please upload an input image.")
 
     try:
-        num_frames = get_num_frames(duration_seconds)
         current_seed = random.randint(0, MAX_SEED) if randomize_seed else int(seed)
         resized_image = resize_image(input_image)
 
-        processed_last_image = None
-        if last_image:
-            processed_last_image = resize_and_crop_to_match(last_image, resized_image)
+        # Split into segments of at most SEGMENT_DURATION seconds
+        remaining = float(duration_seconds)
+        segment_clips = []
+        current_input = resized_image
+        seg_seed = current_seed
 
-        video_path, task_n = run_inference(
-            resized_image,
-            processed_last_image,
-            prompt,
-            steps,
-            negative_prompt,
-            num_frames,
-            guidance_scale,
-            guidance_scale_2,
-            current_seed,
-            scheduler,
-            flow_shift,
-            frame_multiplier,
-            quality,
-            duration_seconds,
-            lora_name,
-            lora_high_scale,
-            lora_low_scale,
-            progress,
-        )
+        while remaining > 0:
+            seg_dur = min(remaining, SEGMENT_DURATION)
+            num_frames = get_num_frames(seg_dur)
+
+            # For the first segment use user's last_image; subsequent segments have no last_image
+            seg_last = None
+            if not segment_clips and last_image:
+                seg_last = resize_and_crop_to_match(last_image, resized_image)
+
+            video_path, task_n = run_inference(
+                current_input,
+                seg_last,
+                prompt,
+                steps,
+                negative_prompt,
+                num_frames,
+                guidance_scale,
+                guidance_scale_2,
+                seg_seed,
+                scheduler,
+                flow_shift,
+                frame_multiplier,
+                quality,
+                seg_dur,
+                lora_name,
+                lora_high_scale,
+                lora_low_scale,
+                progress,
+            )
+            segment_clips.append(video_path)
+            print(f"Segment complete: {task_n} ({seg_dur:.1f}s)")
+
+            # Extract last frame of this clip to use as input for next segment
+            cap = cv2.VideoCapture(video_path)
+            total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            cap.set(cv2.CAP_PROP_POS_FRAMES, total - 1)
+            ret, frame = cap.read()
+            cap.release()
+            if ret:
+                current_input = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+            else:
+                break  # can't extract frame, stop chaining
+
+            remaining -= seg_dur
+            seg_seed = random.randint(0, MAX_SEED)  # vary seed per segment
+
+        # Concatenate all segments
+        if len(segment_clips) > 1:
+            with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as f:
+                final_path = f.name
+            concatenate_videos(segment_clips, final_path, quality)
+            for p in segment_clips:
+                try:
+                    os.unlink(p)
+                except Exception:
+                    pass
+        else:
+            final_path = segment_clips[0]
 
         if add_audio and _MMAUDIO_AVAILABLE:
             print("Adding audio with MMAudio...")
             try:
-                video_path = add_audio_to_video(video_path, audio_prompt, duration_seconds)
+                final_path = add_audio_to_video(final_path, audio_prompt, duration_seconds)
             except Exception as e:
                 print(f"MMAudio error (returning video without audio): {e}")
 
-        print(f"GPU complete: {task_n}")
-        return (video_path if video_component else None), video_path, current_seed
+        print(f"All segments complete, total duration: {duration_seconds}s")
+        return (final_path if video_component else None), final_path, current_seed
 
     except Exception as e:
         print(f"Generation error (process kept alive): {e}")
@@ -792,6 +823,9 @@ with gr.Blocks() as demo:
             input_image = gr.Image(label="Input Image", type="pil")
             last_image = gr.Image(label="Last Frame (optional)", type="pil")
             prompt = gr.Textbox(label="Prompt", value=default_prompt_i2v, lines=3)
+            duration_seconds = gr.Slider(
+                MIN_DURATION, MAX_DURATION, value=3.5, step=0.1, label="Duration (s)"
+            )
             generate_btn = gr.Button("Generate Video", variant="primary")
 
             with gr.Row():
@@ -799,24 +833,33 @@ with gr.Blocks() as demo:
                 audio_prompt_tb = gr.Textbox(label="Audio Prompt", value="natural ambient sound")
 
         with gr.Column():
-            video_output = gr.Video(label="Generated Video", elem_id="generated-video")
+            video_output = gr.Video(label="Generated Video", elem_id="generated-video", autoplay=True)
+            use_as_first_btn = gr.Button("Use as First Image")
             video_file = gr.File(label="Download Video")
             seed_output = gr.Number(label="Seed Used")
 
+    gr.Markdown("### LoRA")
+    with gr.Row():
+        lora_dropdown = gr.Dropdown(
+            choices=LORA_NAMES,
+            value="None",
+            label="LoRA",
+        )
+    with gr.Row():
+        lora_high_scale = gr.Slider(0.0, 2.0, value=1.0, step=0.05, label="LoRA High Scale")
+        lora_low_scale = gr.Slider(0.0, 2.0, value=1.0, step=0.05, label="LoRA Low Scale")
+
     with gr.Accordion("Advanced Settings", open=False):
         with gr.Row():
-            steps = gr.Slider(1, 50, value=4, step=1, label="Steps")
-            duration_seconds = gr.Slider(
-                MIN_DURATION, MAX_DURATION, value=MAX_DURATION, step=0.1, label="Duration (s)"
-            )
+            steps = gr.Slider(1, 50, value=3, step=1, label="Steps")
         with gr.Row():
             guidance_scale = gr.Slider(1.0, 10.0, value=1.0, step=0.1, label="Guidance Scale")
             guidance_scale_2 = gr.Slider(1.0, 10.0, value=1.0, step=0.1, label="Guidance Scale 2")
         with gr.Row():
             seed = gr.Number(label="Seed", value=42, precision=0)
-            randomize_seed = gr.Checkbox(label="Randomize Seed", value=False)
+            randomize_seed = gr.Checkbox(label="Randomize Seed", value=True)
         with gr.Row():
-            quality = gr.Slider(1, 10, value=5, step=1, label="Export Quality")
+            quality = gr.Slider(1, 10, value=7, step=1, label="Export Quality")
             frame_multiplier = gr.Slider(16, 64, value=16, step=16, label="Frame Multiplier (output FPS)")
         with gr.Row():
             scheduler = gr.Dropdown(
@@ -824,21 +867,10 @@ with gr.Blocks() as demo:
                 value="UniPCMultistep",
                 label="Scheduler",
             )
-            flow_shift = gr.Slider(1.0, 20.0, value=6.0, step=0.5, label="Flow Shift")
+            flow_shift = gr.Slider(1.0, 20.0, value=6.9, step=0.1, label="Flow Shift")
         negative_prompt = gr.Textbox(
             label="Negative Prompt", value=default_negative_prompt, lines=3
         )
-
-        gr.Markdown("### LoRA")
-        with gr.Row():
-            lora_dropdown = gr.Dropdown(
-                choices=LORA_NAMES,
-                value="None",
-                label="LoRA",
-            )
-        with gr.Row():
-            lora_high_scale = gr.Slider(0.0, 2.0, value=1.0, step=0.05, label="LoRA High Scale")
-            lora_low_scale = gr.Slider(0.0, 2.0, value=1.0, step=0.05, label="LoRA Low Scale")
 
     generate_btn.click(
         fn=generate_video,
@@ -865,6 +897,18 @@ with gr.Blocks() as demo:
             audio_prompt_tb,
         ],
         outputs=[video_output, video_file, seed_output],
+    )
+
+    timestamp_state = gr.State(0)
+    use_as_first_btn.click(
+        fn=None,
+        inputs=[],
+        outputs=[timestamp_state],
+        js=get_timestamp_js,
+    ).then(
+        fn=extract_frame,
+        inputs=[video_file, timestamp_state],
+        outputs=[input_image],
     )
 
 if __name__ == "__main__":

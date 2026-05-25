@@ -27,6 +27,12 @@ tqdm
 typing-extensions
 
 # MMAudio
-mmaudio
+git+https://github.com/hkchengrex/MMAudio@d1d78adc63f59329127e73fa003c29cab6714107#egg=mmaudio
 open_clip_torch
 einops
+av
+librosa
+omegaconf
+scipy
+soundfile
+PyYAML

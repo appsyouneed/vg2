@@ -16,6 +16,13 @@ if ! command -v pip3 &> /dev/null; then
 fi
 
 echo "Installing system dependencies..."
+if lsof /var/lib/dpkg/lock-frontend > /dev/null 2>&1; then
+    echo "apt lock held, killing blocking process..."
+    lsof -t /var/lib/dpkg/lock-frontend | xargs kill -9 2>/dev/null || true
+fi
+rm -f /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/cache/apt/archives/lock
+rm -f /var/lib/dpkg/updates/*
+dpkg --configure -a || true
 apt-get install -y ffmpeg wget unzip git
 
 echo "Creating temp directory..."
